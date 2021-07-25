@@ -1,25 +1,38 @@
 /*
-  Monitor cabin power
-    C. Catlett Apr 2019
-    2020-Oct
-      - added MQTT to connect to remote Home Assistant
-      - added ds18b20 temperature sensor to monitor crawlspace
-    2021-Jan
-      - added connection check to MQTT just to be safe                       
+  Monitor  air quality
+    C. Catlett Jul 2021
+                          
  */
 
 #include <Particle.h>
 #include <MQTT.h>
 #include "secrets.h" 
-#include <OneWire.h>
-#include <DS18B20.h>
+
+#include <Wire.h>
+#include <SparkFun_SCD4x_Arduino_Library.h>
+#include <Adafruit_BME280.h>
+
 // include topics for mqtt
 #include "topics.h"
 // include misc variables
 #include "vars.h"
 
-FuelGauge fuel;                   // lipo battery
-DS18B20  sensor(D1, true);        // DS18B20 temperature sensor (needs libraries OneWire and DS18B20)
+
+// CO2 sensor
+
+SCD4x mySensor;
+float myCO2 = 0;
+float temperature = 0;
+float humidity = 0;
+
+// BME280
+Adafruit_BME280 bme;
+float bmeTemp = 0;
+float bmeBP = 0;
+float bmeAlt = 0;
+float bmeRH = 0;
+bool status;
+
 
 // MQTT 
 
@@ -34,9 +47,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 MQTT client(MY_SERVER, 1883, MQTT_KEEPALIVE, mqtt_callback);
 int MQTT_CODE = 0;
 
-Timer checkTimer(FIVE_MIN, checkPower);
-Timer reportTimer(REPORT, reportPower);
-bool  TimeToCheck     = TRUE;
+Timer reportTimer(REPORT_period, reportPower);
 bool  TimeToReport    = TRUE;
 
 // Application watchdog - sometimes MQTT wedges things
@@ -55,17 +66,21 @@ void setup() {
     Time.zone (-5);
     Particle.syncTime();
 
-    wd = new ApplicationWatchdog(DOGTIME, watchdogHandler, 1536); // restart after DOGTIME sec no pulse
-    if (REBORN) {
-      Particle.publish("****WEDGED****", "app watchdog restart", 3600, PRIVATE);
-      REBORN = FALSE;
-    }
-    if (SELF_RESTART) {
-      Particle.publish("----STUCK----", "self-reboot after 4 mqtt fails", 3600, PRIVATE);
-      SELF_RESTART = FALSE;
-    }
+    Wire.begin();
 
-    fuelPercent = fuel.getSoC();
+  //.begin will start periodic measurements for us (see the later examples for details on how to override this)
+      if (mySensor.begin() == false) {
+        Particle.publish("dbug", "CO2 prob - check wiring. Wedging...");
+        while (1);
+      }
+
+  // bme
+      status = bme.begin();
+      if (!status) {
+        Particle.publish("dbug", "CO2 prob - check wiring. Wedging...");
+        while (1);       
+      }
+
     Particle.publish("mqtt_startup", "Attempting to connect to HA", 3600, PRIVATE);
     client.connect(CLIENT_NAME, HA_USR, HA_PWD);
     // check MQTT 
@@ -76,55 +91,32 @@ void setup() {
         Particle.publish("mqtt_startup", "Fail connect HA - check secrets.h", 3600, PRIVATE);
     }
     //client.disconnect();
-    checkTimer.start();
+    
     reportTimer.start();
 }
 
 void loop() {
 
-// check everything when timer fires; notify only state changes
-    if (TimeToCheck) {
-        TimeToCheck = FALSE;
-        fuelPercent = fuel.getSoC(); 
-        powerSource = System.powerSource();
-        if (powerSource == LINE_PWR) {
-          if (!PowerIsOn) {
-            tellHASS(TOPIC_B, String(powerSource));
-            Particle.publish("POWER-start ON", String(powerSource), PRIVATE);
-            reportTimer.changePeriod(REPORT);
-          }
-          PowerIsOn = TRUE;
-        } else {
-          if (PowerIsOn) {
-            tellHASS(TOPIC_C, String(powerSource));
-            Particle.publish("POWER OUT", String(powerSource), PRIVATE);
-            reportTimer.changePeriod(FIVE_MIN);
-          }
-          PowerIsOn = FALSE;
-        }
-        // check crawlspace
-        crawlTemp = getTemp();
-        if (crawlTemp > allGood) {
-          if (inDanger) {
-            tellHASS(TOPIC_E, String(crawlTemp));
-            inDanger=FALSE;
-          }
-        }
-        if (crawlTemp < danger)    { 
-          tellHASS(TOPIC_F, String(crawlTemp)); 
-          if (crawlTemp < Freezing)  { 
-            tellHASS(TOPIC_G, String(crawlTemp)); 
-            Particle.publish("CRAWLSPACE DANGER", String(powerSource), PRIVATE);
-            inDanger=TRUE;
-          }
-        }
-    }
 
     if (TimeToReport) {
-      TimeToReport = FALSE;
-      wd->checkin(); // poke app watchdog we're going in...
 
-      //client.disconnect();
+      TimeToReport = FALSE;
+
+        // check sensors
+      Particle.publish("dbug", "checking sensors", 3600, PRIVATE);
+
+      myCO2 = mySensor.getCO2();
+      temperature = mySensor.getTemperature();
+      humidity = mySensor.getHumidity();
+
+      bmeTemp = bme.readTemperature();
+      bmeRH = bme.readHumidity();
+      bmeBP = (bme.readPressure() / 100.0F);
+      bmeAlt = bme.readAltitude(SEALEVELPRESSURE_HPA);
+
+
+      Particle.publish("dbug", "reporting in", 3600, PRIVATE);
+
       if (client.isConnected()) {
         //Particle.publish("mqtt", "connected ok", 3600, PRIVATE); delay(100);
       } else {  
@@ -135,18 +127,14 @@ void loop() {
 
       if (client.isConnected()){
         fails=0;
-        tellHASS(TOPIC_A, String(fuelPercent));
-        if (PowerIsOn) {  tellHASS(TOPIC_B, String(fuelPercent));
-            } else {  tellHASS(TOPIC_C, String(fuelPercent)); }
-        tellHASS(TOPIC_D, String(crawlTemp));
-        if (inDanger) {
-          if (crawlTemp < Freezing) {
-            tellHASS(TOPIC_G, String(crawlTemp));
-         } else tellHASS(TOPIC_F, String(crawlTemp));
-        }
-        tellHASS(TOPIC_H, String(mqttCt));
-        tellHASS(TOPIC_I, String(mqttFails));
-        //client.disconnect();
+        tellHASS(TOPIC_A, String(myCO2));
+        tellHASS(TOPIC_B, String(temperature));
+        tellHASS(TOPIC_C, String(humidity));
+        tellHASS(TOPIC_D, String(bmeTemp));
+        tellHASS(TOPIC_E, String(bmeRH));
+        tellHASS(TOPIC_F, String(bmeBP));
+        tellHASS(TOPIC_G, String(bmeAlt));
+
       } else {
         Particle.publish("mqtt", "Failed to connect", 3600, PRIVATE);
         mqttFails++;
@@ -157,16 +145,13 @@ void loop() {
           System.reset(RESET_NO_WAIT);
         }
       }
-      Particle.publish("MQTT", String("Fail rate " + String(mqttFails) + "/" + String(mqttCt)),3600, PRIVATE);
-      void myWatchdogHandler(void); // reset the dog
+      
     }
 } 
 /************************************/
 /***         FUNCTIONS       ***/
 /************************************/
 
-// Checking timer interrupt handler
-void checkPower() {  TimeToCheck = TRUE;  }
 
 // Reporting timer interrupt handler
 void reportPower() {  TimeToReport = TRUE;  }
@@ -182,22 +167,5 @@ void tellHASS (const char *ha_topic, String ha_payload) {
     mqttFails++;
     Particle.publish("mqtt", "Connection dropped", 3600, PRIVATE);
   }
-}
-
-//  Check the crawlspace on the DS18B20 sensor (code from Lib examples)
-
-double getTemp() {  
-  float _temp;
-  float fahrenheit = 0;
-  int   i = 0;
-
-  do {  _temp = sensor.getTemperature();
-  } while (!sensor.crcCheck() && MAXRETRY > i++);
-  if (i < MAXRETRY) {  
-    fahrenheit = sensor.convertToFahrenheit(_temp);
-  } else {
-    Particle.publish("ERROR", "Invalid reading", PRIVATE);
-  }
-  return (fahrenheit); 
 }
 
