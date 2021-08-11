@@ -17,26 +17,8 @@
 // include misc variables
 #include "vars.h"
 
-
-// CO2 sensor
-
-SCD4x mySensor;
-float myCO2 = 0;
-float temperature = 0;
-float humidity = 0;
-
-// BME280
-Adafruit_BME280 bme;
-float bmeTemp = 0;
-float bmeBP = 0;
-float bmeAlt = 0;
-float bmeRH = 0;
-bool status;
-
-
 // MQTT 
-
-#define MQTT_KEEPALIVE 35 * 60              // 60s is std default
+#define MQTT_KEEPALIVE 30 * 60              // 60s is std default
 void timer_callback_send_mqqt_data();    
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
      char p[length + 1];
@@ -70,15 +52,12 @@ void setup() {
 
   //.begin will start periodic measurements for us (see the later examples for details on how to override this)
       if (mySensor.begin() == false) {
-        Particle.publish("dbug", "CO2 prob - check wiring. Wedging...");
-        while (1);
+        Particle.publish("dbug", "CO2 prob - check wiring.");
       }
 
   // bme
-      status = bme.begin();
-      if (!status) {
-        Particle.publish("dbug", "CO2 prob - check wiring. Wedging...");
-        while (1);       
+      if (bme.begin() == false) {
+        Particle.publish("dbug", "CO2 prob - check wiring.");
       }
 
     Particle.publish("mqtt_startup", "Attempting to connect to HA", 3600, PRIVATE);
@@ -103,34 +82,38 @@ void loop() {
       TimeToReport = FALSE;
 
         // check sensors
-      Particle.publish("dbug", "checking sensors", 3600, PRIVATE);
+      //Particle.publish("dbug", "checking sensors", 3600, PRIVATE);
 
       myCO2 = mySensor.getCO2();
       temperature = mySensor.getTemperature();
+      temperatureF = (temperature * 9/5) + 32;
       humidity = mySensor.getHumidity();
 
       bmeTemp = bme.readTemperature();
+      bmeTempF = (bmeTemp * 9/5) + 32;
       bmeRH = bme.readHumidity();
       bmeBP = (bme.readPressure() / 100.0F);
       bmeAlt = bme.readAltitude(SEALEVELPRESSURE_HPA);
 
 
-      Particle.publish("dbug", "reporting in", 3600, PRIVATE);
+     // if (++reportCounter%10=0) {
+     //   Particle.publish("dbug", "reporting in", 3600, PRIVATE);
+    //  }
 
       if (client.isConnected()) {
-        //Particle.publish("mqtt", "connected ok", 3600, PRIVATE); delay(100);
+      //  Particle.publish("dbug", "still connected from last time", 3600, PRIVATE); delay(100);
       } else {  
-        Particle.publish("mqtt", "reconnecting", 3600, PRIVATE); delay(100);
+        //Particle.publish("mqtt", "reconnecting", 3600, PRIVATE); delay(100);
         client.connect(CLIENT_NAME, HA_USR,HA_PWD);
-        delay(2000);
+       // delay(2000);
       }
 
       if (client.isConnected()){
         fails=0;
         tellHASS(TOPIC_A, String(myCO2));
-        tellHASS(TOPIC_B, String(temperature));
+        tellHASS(TOPIC_B, String(temperatureF));
         tellHASS(TOPIC_C, String(humidity));
-        tellHASS(TOPIC_D, String(bmeTemp));
+        tellHASS(TOPIC_D, String(bmeTempF));
         tellHASS(TOPIC_E, String(bmeRH));
         tellHASS(TOPIC_F, String(bmeBP));
         tellHASS(TOPIC_G, String(bmeAlt));
@@ -159,10 +142,11 @@ void reportPower() {  TimeToReport = TRUE;  }
 // Report to HASS via MQTT
 void tellHASS (const char *ha_topic, String ha_payload) {  
 
-  delay(100); // bit of delay in between successive messages
+  //delay(100); // bit of delay in between successive messages
   if (client.isConnected()){
     client.publish(ha_topic, ha_payload);
     mqttCt++;
+//    Particle.publish("dbug", "still connected", 3600, PRIVATE);
   } else {
     mqttFails++;
     Particle.publish("mqtt", "Connection dropped", 3600, PRIVATE);
